@@ -1,0 +1,11 @@
+Universal Hardware Debugger and Serial Monitor Icon
+
+This file is a placeholder for the application icon.
+In a production environment, this would be replaced with a proper icon file (PNG, ICO, or SVG).
+
+The icon design would feature:
+- Circuit board traces
+- Microcontroller representation
+- Serial data visualization
+- Connection points
+- Color scheme matching the application theme

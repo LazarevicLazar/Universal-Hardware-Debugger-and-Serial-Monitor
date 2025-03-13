@@ -1,0 +1,23 @@
+# Test Automation Script
+# This script demonstrates the simple automation capabilities
+
+# Send a version query command
+AT+GMR
+
+# Wait for 1 second
+DELAY:1
+
+# Send a scan for WiFi networks command
+AT+CWLAP
+
+# Wait for 2 seconds
+DELAY:2
+
+# Send a system info command
+AT+SYSINFO
+
+# Wait for 1 second
+DELAY:1
+
+# Send a reset command
+AT+RST
