@@ -25,8 +25,14 @@ class SerialConnection(QObject):
     data_received = pyqtSignal(str, str, str)  # port, data, timestamp
     connection_status_changed = pyqtSignal(str, bool)  # port, connected
     error_occurred = pyqtSignal(str, str)  # port, error message
+    reconnect_attempt = pyqtSignal(str, int)  # port, attempt number
     
-    def __init__(self, port, baud_rate=115200, data_bits=8, parity='N', stop_bits=1, flow_control='none'):
+    # Constants
+    MAX_BUFFER_SIZE = 1024 * 1024  # 1MB maximum buffer size
+    STALLED_CONNECTION_TIMEOUT = 30  # seconds without activity to consider connection stalled
+    
+    def __init__(self, port, baud_rate=115200, data_bits=8, parity='N', stop_bits=1,
+                 flow_control='none', auto_reconnect=True, reconnect_interval=5):
         """Initialize a serial connection"""
         super().__init__()
         
@@ -37,13 +43,26 @@ class SerialConnection(QObject):
         self.stop_bits = stop_bits
         self.flow_control = flow_control
         
+        # Reconnection settings
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_interval = reconnect_interval
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        
         self.serial = None
         self.connected = False
         self.running = False
         
+        # Thread synchronization
+        self.stats_lock = threading.Lock()
+        self.buffer_lock = threading.Lock()
+        
         self.read_thread = None
         self.write_queue = queue.Queue()
         self.write_thread = None
+        
+        # Stalled connection detection
+        self.stalled_check_timer = None
         
         self.parser = DataParser()
         
@@ -55,12 +74,17 @@ class SerialConnection(QObject):
             "packets_sent": 0,
             "errors": 0,
             "connect_time": None,
-            "last_activity": None
+            "last_activity": None,
+            "reconnect_attempts": 0,
+            "stalled_detected": 0
         }
     
     def open(self):
         """Open the serial connection"""
         try:
+            # Reset reconnection attempts
+            self.reconnect_attempts = 0
+            
             # Log detailed connection attempt
             logger.info(f"Opening serial connection to {self.port} with settings: "
                        f"baud_rate={self.baud_rate}, data_bits={self.data_bits}, "
@@ -88,13 +112,17 @@ class SerialConnection(QObject):
             self.write_thread = threading.Thread(target=self._write_loop, daemon=True)
             self.write_thread.start()
             
+            # Start stalled connection detection
+            self._start_stalled_connection_detection()
+            
             # Update connection status
             self.connected = True
             self.connection_status_changed.emit(self.port, True)
             
-            # Update statistics
-            self.stats["connect_time"] = datetime.now()
-            self.stats["last_activity"] = datetime.now()
+            # Update statistics with thread safety
+            with self.stats_lock:
+                self.stats["connect_time"] = datetime.now()
+                self.stats["last_activity"] = datetime.now()
             
             logger.info(f"Serial connection opened successfully: {self.port} at {self.baud_rate} baud")
             return True
@@ -112,12 +140,18 @@ class SerialConnection(QObject):
             else:
                 logger.error(f"Serial error opening connection to {self.port}: {e}")
                 self.error_occurred.emit(self.port, f"Serial error: {error_msg}")
-            self.stats["errors"] += 1
+            
+            with self.stats_lock:
+                self.stats["errors"] += 1
+            
             return False
         except Exception as e:
             logger.error(f"Error opening serial connection to {self.port}: {e}")
             self.error_occurred.emit(self.port, str(e))
-            self.stats["errors"] += 1
+            
+            with self.stats_lock:
+                self.stats["errors"] += 1
+            
             return False
     
     def close(self):
@@ -125,6 +159,9 @@ class SerialConnection(QObject):
         try:
             # Stop the read and write threads
             self.running = False
+            
+            # Stop stalled connection detection
+            self._stop_stalled_connection_detection()
             
             if self.read_thread and self.read_thread.is_alive():
                 self.read_thread.join(timeout=1.0)
@@ -145,7 +182,10 @@ class SerialConnection(QObject):
         except Exception as e:
             logger.error(f"Error closing serial connection: {e}")
             self.error_occurred.emit(self.port, str(e))
-            self.stats["errors"] += 1
+            
+            with self.stats_lock:
+                self.stats["errors"] += 1
+            
             return False
     
     def send(self, data, add_newline=True):
@@ -172,6 +212,8 @@ class SerialConnection(QObject):
     def _read_loop(self):
         """Read data from the device in a loop"""
         buffer = bytearray()
+        consecutive_errors = 0
+        max_consecutive_errors = 3
         
         while self.running:
             try:
@@ -180,35 +222,71 @@ class SerialConnection(QObject):
                     data = self.serial.read(1024)
                     
                     if data:
-                        # Update statistics
-                        self.stats["bytes_received"] += len(data)
-                        self.stats["last_activity"] = datetime.now()
+                        # Reset error counter on successful read
+                        consecutive_errors = 0
                         
-                        # Add to buffer
-                        buffer.extend(data)
+                        # Update statistics with thread safety
+                        with self.stats_lock:
+                            self.stats["bytes_received"] += len(data)
+                            self.stats["last_activity"] = datetime.now()
                         
-                        # Process the buffer
-                        lines = self.parser.process_data(buffer)
-                        
-                        # Clear the processed data from the buffer
-                        buffer = bytearray(self.parser.get_remaining_buffer())
+                        # Add to buffer with thread safety and size limit
+                        with self.buffer_lock:
+                            # Check buffer size before adding data
+                            if len(buffer) + len(data) > self.MAX_BUFFER_SIZE:
+                                # Buffer would exceed max size, truncate it
+                                logger.warning(f"Buffer size limit reached ({self.MAX_BUFFER_SIZE} bytes), truncating buffer")
+                                buffer = buffer[-self.MAX_BUFFER_SIZE//2:]  # Keep the last half
+                            
+                            # Add to buffer
+                            buffer.extend(data)
+                            
+                            # Process the buffer
+                            lines = self.parser.process_data(buffer)
+                            
+                            # Clear the processed data from the buffer
+                            buffer = bytearray(self.parser.get_remaining_buffer())
                         
                         # Emit signals for each line
                         for line in lines:
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                             self.data_received.emit(self.port, line, timestamp)
-                            self.stats["packets_received"] += 1
+                            with self.stats_lock:
+                                self.stats["packets_received"] += 1
                 
                 # Sleep to avoid high CPU usage
                 time.sleep(0.01)
+                
+            except serial.SerialException as e:
+                # Handle serial-specific errors
+                logger.error(f"Serial error in read loop: {e}")
+                self.error_occurred.emit(self.port, f"Serial error: {str(e)}")
+                with self.stats_lock:
+                    self.stats["errors"] += 1
+                consecutive_errors += 1
+                
+                # Attempt to reconnect after serial errors
+                if consecutive_errors >= max_consecutive_errors and self.auto_reconnect:
+                    logger.warning(f"Too many consecutive errors, attempting to reconnect: {self.port}")
+                    self._attempt_reconnect()
+                    consecutive_errors = 0
+                
+                time.sleep(1.0)  # Sleep longer after an error
+                
             except Exception as e:
-                logger.error(f"Error in read loop: {e}")
+                # Handle other unexpected errors
+                logger.error(f"Unexpected error in read loop: {e}")
                 self.error_occurred.emit(self.port, str(e))
-                self.stats["errors"] += 1
+                with self.stats_lock:
+                    self.stats["errors"] += 1
+                consecutive_errors += 1
                 time.sleep(1.0)  # Sleep longer after an error
     
     def _write_loop(self):
         """Write data to the device in a loop"""
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+        
         while self.running:
             try:
                 # Get data from the write queue
@@ -226,17 +304,41 @@ class SerialConnection(QObject):
                     self.serial.write(data)
                     self.serial.flush()
                     
-                    # Update statistics
-                    self.stats["bytes_sent"] += len(data)
-                    self.stats["packets_sent"] += 1
-                    self.stats["last_activity"] = datetime.now()
+                    # Reset error counter on successful write
+                    consecutive_errors = 0
+                    
+                    # Update statistics with thread safety
+                    with self.stats_lock:
+                        self.stats["bytes_sent"] += len(data)
+                        self.stats["packets_sent"] += 1
+                        self.stats["last_activity"] = datetime.now()
                     
                     # Mark the task as done
                     self.write_queue.task_done()
+                    
+            except serial.SerialException as e:
+                # Handle serial-specific errors
+                logger.error(f"Serial error in write loop: {e}")
+                self.error_occurred.emit(self.port, f"Serial write error: {str(e)}")
+                with self.stats_lock:
+                    self.stats["errors"] += 1
+                consecutive_errors += 1
+                
+                # Attempt to reconnect after serial errors
+                if consecutive_errors >= max_consecutive_errors and self.auto_reconnect:
+                    logger.warning(f"Too many consecutive write errors, attempting to reconnect: {self.port}")
+                    self._attempt_reconnect()
+                    consecutive_errors = 0
+                
+                time.sleep(1.0)  # Sleep longer after an error
+                
             except Exception as e:
-                logger.error(f"Error in write loop: {e}")
+                # Handle other unexpected errors
+                logger.error(f"Unexpected error in write loop: {e}")
                 self.error_occurred.emit(self.port, str(e))
-                self.stats["errors"] += 1
+                with self.stats_lock:
+                    self.stats["errors"] += 1
+                consecutive_errors += 1
                 time.sleep(1.0)  # Sleep longer after an error
     
     def get_statistics(self):
@@ -259,6 +361,106 @@ class SerialConnection(QObject):
     def set_parser_mode(self, mode):
         """Set the parser mode"""
         self.parser.set_mode(mode)
+    
+    def _attempt_reconnect(self):
+        """Attempt to reconnect after connection errors"""
+        # Only attempt reconnection if enabled and not exceeded max attempts
+        if not self.auto_reconnect or self.reconnect_attempts >= self.max_reconnect_attempts:
+            if self.reconnect_attempts >= self.max_reconnect_attempts:
+                logger.error(f"Maximum reconnection attempts ({self.max_reconnect_attempts}) reached for {self.port}")
+            return False
+        
+        try:
+            logger.info(f"Attempting to reconnect to {self.port} (attempt {self.reconnect_attempts + 1}/{self.max_reconnect_attempts})")
+            self.reconnect_attempts += 1
+            
+            with self.stats_lock:
+                self.stats["reconnect_attempts"] += 1
+            
+            # Emit reconnect attempt signal
+            self.reconnect_attempt.emit(self.port, self.reconnect_attempts)
+            
+            # Close the current connection if it exists
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+                time.sleep(0.5)  # Short delay before reconnecting
+            
+            # Reopen the connection
+            self.serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baud_rate,
+                bytesize=self.data_bits,
+                parity=self.parity,
+                stopbits=self.stop_bits,
+                xonxoff=(self.flow_control == 'xonxoff'),
+                rtscts=(self.flow_control == 'rtscts'),
+                dsrdtr=(self.flow_control == 'dsrdtr'),
+                timeout=0.1
+            )
+            
+            # Update connection status
+            self.connected = True
+            self.connection_status_changed.emit(self.port, True)
+            
+            logger.info(f"Successfully reconnected to {self.port}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to reconnect to {self.port}: {e}")
+            
+            # Schedule another reconnection attempt after the interval
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                threading.Timer(self.reconnect_interval, self._attempt_reconnect).start()
+            
+            return False
+    
+    def _start_stalled_connection_detection(self):
+        """Start the stalled connection detection timer"""
+        self._stop_stalled_connection_detection()  # Stop any existing timer
+        
+        self.stalled_check_timer = threading.Timer(self.STALLED_CONNECTION_TIMEOUT / 2, self._check_stalled_connection)
+        self.stalled_check_timer.daemon = True
+        self.stalled_check_timer.start()
+    
+    def _stop_stalled_connection_detection(self):
+        """Stop the stalled connection detection timer"""
+        if self.stalled_check_timer:
+            self.stalled_check_timer.cancel()
+            self.stalled_check_timer = None
+    
+    def _check_stalled_connection(self):
+        """Check if the connection is stalled (no activity for a long time)"""
+        try:
+            if not self.connected or not self.running:
+                return
+            
+            current_time = datetime.now()
+            
+            with self.stats_lock:
+                last_activity = self.stats["last_activity"]
+            
+            if last_activity:
+                time_since_activity = (current_time - last_activity).total_seconds()
+                
+                if time_since_activity > self.STALLED_CONNECTION_TIMEOUT:
+                    logger.warning(f"Stalled connection detected on {self.port}: No activity for {time_since_activity:.1f} seconds")
+                    
+                    with self.stats_lock:
+                        self.stats["stalled_detected"] += 1
+                    
+                    # Attempt to reconnect if auto-reconnect is enabled
+                    if self.auto_reconnect:
+                        self._attempt_reconnect()
+            
+            # Schedule the next check
+            if self.running:
+                self._start_stalled_connection_detection()
+                
+        except Exception as e:
+            logger.error(f"Error checking for stalled connection: {e}")
+            # Reschedule even on error
+            if self.running:
+                self._start_stalled_connection_detection()
 
 
 class SerialConnectionManager(QObject):
@@ -275,8 +477,8 @@ class SerialConnectionManager(QObject):
         self.app = app
         self.connections = {}
     
-    def open_connection(self, port, baud_rate=None, data_bits=None, parity=None, stop_bits=None, flow_control=None):
-        """Open a serial connection"""
+    def open_connection(self, port, baud_rate=None, data_bits=None, parity=None, stop_bits=None, flow_control=None, auto_reconnect=None, reconnect_interval=None):
+        """Open a serial connection with improved error handling and reconnection"""
         try:
             # Check if already connected
             if port in self.connections and self.connections[port].connected:
@@ -298,6 +500,12 @@ class SerialConnectionManager(QObject):
             
             if flow_control is None:
                 flow_control = self.app.config.get("serial", "default_flow_control", "none")
+                
+            if auto_reconnect is None:
+                auto_reconnect = self.app.config.get("serial", "auto_reconnect", True)
+                
+            if reconnect_interval is None:
+                reconnect_interval = self.app.config.get("serial", "reconnect_interval", 5)
             
             # Log connection attempt with detailed parameters
             logger.info(f"Attempting to open connection to {port} with settings: "
@@ -310,14 +518,16 @@ class SerialConnectionManager(QObject):
                 logger.error(f"Port {port} not found. Available ports: {available_ports}")
                 return False
             
-            # Create a new connection
+            # Create a new connection with reconnection capability
             connection = SerialConnection(
                 port=port,
                 baud_rate=baud_rate,
                 data_bits=data_bits,
                 parity=parity,
                 stop_bits=stop_bits,
-                flow_control=flow_control
+                flow_control=flow_control,
+                auto_reconnect=auto_reconnect,
+                reconnect_interval=reconnect_interval
             )
             
             # Connect signals

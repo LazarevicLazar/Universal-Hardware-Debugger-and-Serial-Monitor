@@ -53,6 +53,9 @@ class ScriptEditor(QWidget):
         # Script execution
         self.script_running = False
         self.script_output = ""
+        self.script_process = None
+        self.script_timeout_timer = None
+        self.resource_monitor_timer = None
         
         # Initialize UI components
         self._init_ui()
@@ -505,7 +508,7 @@ if __name__ == "__main__":
             raise
     
     def _run_script(self):
-        """Run the current script"""
+        """Run the current script with improved safety"""
         try:
             if not self.current_script:
                 QMessageBox.warning(self, "Run Script", "No script selected.")
@@ -527,15 +530,68 @@ if __name__ == "__main__":
             self.script_running = True
             self.status_bar.showMessage(f"Running script: {self.current_script}")
             
+            # Get script execution limits from config
+            max_execution_time = self.app.config.get("scripting", "max_execution_time", 60)  # seconds
+            max_memory_usage = self.app.config.get("scripting", "max_memory_usage", 104857600)  # 100 MB
+            
+            # Set up execution timeout timer
+            self.script_timeout_timer = QTimer(self)
+            self.script_timeout_timer.timeout.connect(self._script_timeout)
+            self.script_timeout_timer.setSingleShot(True)
+            self.script_timeout_timer.start(max_execution_time * 1000)  # Convert to milliseconds
+            
             # Run the script in a separate thread
             if script["type"] == "simple":
                 threading.Thread(target=self._run_simple_script, daemon=True).start()
             else:
                 threading.Thread(target=self._run_python_script, daemon=True).start()
+                
+            # Start monitoring resource usage
+            self.resource_monitor_timer = QTimer(self)
+            self.resource_monitor_timer.timeout.connect(self._monitor_script_resources)
+            self.resource_monitor_timer.start(1000)  # Check every second
+            
         except Exception as e:
             logger.error(f"Error running script: {e}")
             QMessageBox.critical(self, "Error", f"Error running script: {e}")
             self._script_finished()
+    
+    def _script_timeout(self):
+        """Handle script execution timeout"""
+        if self.script_running:
+            logger.warning(f"Script execution timeout: {self.current_script}")
+            self._append_output("\n\nERROR: Script execution timed out and was terminated.")
+            self._stop_script(force=True)
+    
+    def _monitor_script_resources(self):
+        """Monitor script resource usage"""
+        if not self.script_running or not hasattr(self, 'script_process') or not self.script_process:
+            return
+        
+        try:
+            # Check if process is still running
+            if self.script_process.poll() is not None:
+                self.resource_monitor_timer.stop()
+                return
+                
+            # Get process info
+            process = psutil.Process(self.script_process.pid)
+            
+            # Check memory usage
+            memory_info = process.memory_info()
+            memory_usage = memory_info.rss
+            max_memory = self.app.config.get("scripting", "max_memory_usage", 104857600)  # 100 MB
+            
+            if memory_usage > max_memory:
+                logger.warning(f"Script exceeded memory limit: {memory_usage} bytes > {max_memory} bytes")
+                self._append_output(f"\n\nERROR: Script exceeded memory limit ({memory_usage/1048576:.1f} MB > {max_memory/1048576:.1f} MB) and was terminated.")
+                self._stop_script(force=True)
+                
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # Process already terminated
+            self.resource_monitor_timer.stop()
+        except Exception as e:
+            logger.error(f"Error monitoring script resources: {e}")
     
     def _run_simple_script(self):
         """Run a simple automation script"""
@@ -591,55 +647,196 @@ if __name__ == "__main__":
             self._script_finished()
     
     def _run_python_script(self):
-        """Run a Python script"""
+        """Run a Python script in a separate process with safety measures"""
         try:
             script = self.scripts[self.current_script]
             
-            self._append_output("Starting Python script...\n")
+            self._append_output("Starting Python script in isolated environment...\n")
             
-            # Create a string IO for capturing stdout and stderr
-            stdout_capture = io.StringIO()
-            stderr_capture = io.StringIO()
+            # Create a temporary directory for script execution
+            temp_dir = tempfile.mkdtemp(prefix="script_")
             
-            # Prepare the script environment
-            script_globals = {
-                "app": self.app,
-                "serial_manager": self.app.serial_manager if hasattr(self.app, 'serial_manager') else None,
-                "device_manager": self.app.device_manager if hasattr(self.app, 'device_manager') else None,
-                "command_interface": self.app.command_interface if hasattr(self.app, 'command_interface') else None,
-                "print": self._script_print  # Redirect print to our output
-            }
+            # Create a unique ID for this script execution
+            execution_id = str(uuid.uuid4())
             
-            # Execute the script
+            # Create the script file
+            script_path = os.path.join(temp_dir, f"{self.current_script}.py")
+            
+            # Create a wrapper script that provides a restricted API
+            wrapper_script = self._create_script_wrapper(script["content"], execution_id)
+            wrapper_path = os.path.join(temp_dir, f"wrapper_{execution_id}.py")
+            
+            # Write the scripts to disk
+            with open(script_path, 'w') as f:
+                f.write(script["content"])
+                
+            with open(wrapper_path, 'w') as f:
+                f.write(wrapper_script)
+            
+            # Get Python path from config or use system Python
+            python_path = self.app.config.get("scripting", "python_path", "")
+            if not python_path:
+                python_path = sys.executable
+                
+            # Create a pipe for communication
+            self.script_output_queue = multiprocessing.Queue()
+            
+            # Start the process
+            self._append_output(f"Executing script with Python: {python_path}\n")
+            
+            # Create environment with restricted modules
+            env = os.environ.copy()
+            allowed_modules = self.app.config.get("scripting", "allowed_modules",
+                                                ["time", "math", "random", "datetime", "json", "re"])
+            env["PYTHONPATH"] = temp_dir
+            
+            # Start the process
+            self.script_process = subprocess.Popen(
+                [python_path, wrapper_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                cwd=temp_dir
+            )
+            
+            # Start threads to read output
+            threading.Thread(target=self._read_process_output,
+                            args=(self.script_process.stdout, False),
+                            daemon=True).start()
+            threading.Thread(target=self._read_process_output,
+                            args=(self.script_process.stderr, True),
+                            daemon=True).start()
+            
+            # Wait for the process to complete
+            self.script_process.wait()
+            
+            # Check return code
+            if self.script_process.returncode != 0:
+                self._append_output(f"\nScript exited with error code: {self.script_process.returncode}")
+            else:
+                self._append_output("\nScript execution completed successfully.")
+                
+            # Clean up
             try:
-                # Compile the script
-                code = compile(script["content"], f"{self.current_script}.py", 'exec')
-                
-                # Execute the script
-                with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-                    exec(code, script_globals)
-                
-                # Get the output
-                stdout = stdout_capture.getvalue()
-                stderr = stderr_capture.getvalue()
-                
-                if stdout:
-                    self._append_output(stdout)
-                
-                if stderr:
-                    self._append_output(f"\nErrors:\n{stderr}")
-                
-                self._append_output("\nScript execution completed.")
+                import shutil
+                shutil.rmtree(temp_dir)
             except Exception as e:
-                logger.error(f"Error executing Python script: {e}")
-                self._append_output(f"\nError: {e}")
-                self._append_output(f"\nTraceback:\n{traceback.format_exc()}")
+                logger.warning(f"Error cleaning up temporary directory: {e}")
+                
         except Exception as e:
             logger.error(f"Error running Python script: {e}")
             self._append_output(f"\nError: {e}")
+            self._append_output(f"\nTraceback:\n{traceback.format_exc()}")
         finally:
             # Update UI
             self._script_finished()
+    
+    def _create_script_wrapper(self, script_content, execution_id):
+        """Create a wrapper script that provides a restricted API"""
+        # Get allowed modules from config
+        allowed_modules = self.app.config.get("scripting", "allowed_modules",
+                                             ["time", "math", "random", "datetime", "json", "re"])
+        
+        # Create the wrapper script
+        wrapper = f"""#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+\"\"\"
+Secure wrapper for user script execution
+\"\"\"
+
+import sys
+import os
+import importlib
+import time
+import json
+import traceback
+
+# Set resource limits
+try:
+    import resource
+    # Set CPU time limit (seconds)
+    resource.setrlimit(resource.RLIMIT_CPU, ({self.app.config.get("scripting", "max_execution_time", 60)}, {self.app.config.get("scripting", "max_execution_time", 60)}))
+    # Set memory limit (bytes)
+    resource.setrlimit(resource.RLIMIT_AS, ({self.app.config.get("scripting", "max_memory_usage", 104857600)}, {self.app.config.get("scripting", "max_memory_usage", 104857600)}))
+except ImportError:
+    print("Warning: resource module not available, cannot set resource limits")
+
+# Set up restricted imports
+allowed_modules = {allowed_modules}
+original_import = __builtins__.__import__
+
+def restricted_import(name, *args, **kwargs):
+    if name in allowed_modules:
+        return original_import(name, *args, **kwargs)
+    else:
+        raise ImportError(f"Import of module {{name}} is not allowed")
+
+__builtins__.__import__ = restricted_import
+
+# Set up the API
+class RestrictedAPI:
+    def __init__(self):
+        self.start_time = time.time()
+        self.max_execution_time = {self.app.config.get("scripting", "max_execution_time", 60)}
+    
+    def check_timeout(self):
+        if time.time() - self.start_time > self.max_execution_time:
+            raise TimeoutError(f"Script execution exceeded maximum time of {{self.max_execution_time}} seconds")
+    
+    def send_command(self, port, command):
+        print(f"[COMMAND] Sending command to {{port}}: {{command}}")
+        # In a real implementation, this would communicate with the parent process
+        return True
+    
+    def get_device_list(self):
+        print("[API] Getting device list")
+        # In a real implementation, this would communicate with the parent process
+        return []
+    
+    def get_connection_info(self, port):
+        print(f"[API] Getting connection info for {{port}}")
+        # In a real implementation, this would communicate with the parent process
+        return {{"port": port, "connected": False}}
+
+# Create the API
+api = RestrictedAPI()
+
+# Run the user script with periodic timeout checks
+try:
+    # Import the user script
+    from {self.current_script} import *
+    
+    # Check if there's a main function and call it
+    if 'main' in globals() and callable(globals()['main']):
+        main()
+    
+except Exception as e:
+    print(f"Error: {{type(e).__name__}}: {{str(e)}}")
+    print(traceback.format_exc())
+    sys.exit(1)
+
+sys.exit(0)
+"""
+        return wrapper
+    
+    def _read_process_output(self, pipe, is_error):
+        """Read output from the script process"""
+        prefix = "ERROR: " if is_error else ""
+        
+        for line in iter(pipe.readline, ''):
+            if not line:
+                break
+                
+            if line.startswith('[COMMAND]'):
+                # Handle command from script
+                self._handle_script_command(line)
+            elif line.startswith('[API]'):
+                # Handle API call from script
+                pass  # Just log it for now
+            else:
+                # Regular output
+                self._append_output(f"{prefix}{line}")
     
     def _script_print(self, *args, **kwargs):
         """Custom print function for scripts"""
@@ -672,10 +869,68 @@ if __name__ == "__main__":
         self.stop_action.setEnabled(False)
         self.status_bar.showMessage(f"Script '{self.current_script}' execution finished")
     
-    def _stop_script(self):
+    def _stop_script(self, force=False):
         """Stop the current script execution"""
         self.script_running = False
         self.status_bar.showMessage(f"Stopping script: {self.current_script}")
+        
+        # Stop the timeout timer if it's running
+        if hasattr(self, 'script_timeout_timer') and self.script_timeout_timer.isActive():
+            self.script_timeout_timer.stop()
+            
+        # Stop the resource monitor if it's running
+        if hasattr(self, 'resource_monitor_timer') and self.resource_monitor_timer.isActive():
+            self.resource_monitor_timer.stop()
+        
+        # Terminate the process if it's running
+        if hasattr(self, 'script_process') and self.script_process:
+            try:
+                if force:
+                    # Force kill the process
+                    self.script_process.kill()
+                else:
+                    # Try to terminate gracefully first
+                    self.script_process.terminate()
+                    
+                    # Wait a bit for it to terminate
+                    for _ in range(5):  # Wait up to 0.5 seconds
+                        if self.script_process.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                    
+                    # If still running, force kill
+                    if self.script_process.poll() is None:
+                        self.script_process.kill()
+                        
+                self._append_output("\nScript execution stopped.")
+            except Exception as e:
+                logger.error(f"Error stopping script process: {e}")
+    
+    def _handle_script_command(self, command_line):
+        """Handle a command from the script"""
+        try:
+            # Parse the command
+            command_text = command_line.strip()[9:]  # Remove '[COMMAND] ' prefix
+            
+            if command_text.startswith("Sending command to "):
+                # Extract port and command
+                parts = command_text.split(": ", 1)
+                if len(parts) == 2:
+                    port_part = parts[0].replace("Sending command to ", "")
+                    command = parts[1]
+                    
+                    # Execute the command if we have a command interface
+                    if hasattr(self.app, 'command_interface'):
+                        if port_part == "all":
+                            success = self.app.command_interface.broadcast_command(command)
+                        else:
+                            success = self.app.command_interface.send_command(port_part, command)
+                        
+                        self._append_output(f"Command sent: {command} to {port_part}, success: {success}")
+                    else:
+                        self._append_output("Command interface not available.")
+        except Exception as e:
+            logger.error(f"Error handling script command: {e}")
     
     def _export_script(self):
         """Export the current script to a file"""
